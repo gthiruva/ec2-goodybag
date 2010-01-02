@@ -64,14 +64,6 @@ done
 echo "Remaining arguments:"
 for arg do echo '--> '"\`$arg'" ; done
 
-# Absence of the --ami-id option indicates that we are imaging the live root partition and
-# not a registered instance-store instance
-if [[ $AMI_ID == "" ]]
-then
-    ksize=$(df -k / | tail -1 | tr -s ' ' | tr ' ' ',' | cut -d, -f2) # Get the used size of root partition in kbytes
-    (( VOL_SIZE = ksize / 1024 /1024 + 2))                            # Convert to GB and add 2 GB to be safe
-fi
-
 echo if "[[ ( $ACCESS_ID == "" ) || ( $SECRET_KEY == "" ) || ( $PRIVATE_KEY == "" ) || ( $CERT == "" ) || ( $EBS_DEV == "" ) || ( $DESCR == "" ) || ( $RESULT_NAME == "" ) ]]"
 if [[ ( $ACCESS_ID == "" ) || ( $SECRET_KEY == "" ) || ( $PRIVATE_KEY == "" ) || ( $CERT == "" ) || ( $EBS_DEV == "" ) || ( $DESCR == "" ) || ( $RESULT_NAME == "" ) ]]
 then
@@ -80,35 +72,53 @@ then
     exit 1
 fi
 
-IFS='' AMI_DATA=`ec2dim -v $AMI_ID`
-ARCH=`echo $AMI_DATA | grep 'architecture' | sed -e 's/^.*architecture>\(.*\)<.*$/\1/'`
-MANIFEST_PATH=`echo $AMI_DATA | grep 'imageLocation' | sed -e 's/^.*imageLocation>\(.*\)\/\(.*\)<.*$/\/\1/'`
-MANIFEST_PREFIX=`echo $AMI_DATA | grep 'name' | sed -e 's/^.*name>\(.*\)<.*$/\1/'`
+# Absence of the --ami-id option indicates that we are imaging the live root partition and                                                                                                                                                      # not a registered instance-store instance                                                                                                                                                                                                      
+if [[ $AMI_ID == "" ]]
+then
+    ksize=$(df -k / | tail -1 | tr -s ' ' | tr ' ' ',' | cut -d, -f2) # Get the used size of root partition in kbytes
+    (( VOL_SIZE = ksize / 1024 /1024 + 2))                            # Convert to GB and add 2 GB to be safe
 
-echo grabbing bundle $MANIFEST_PATH -- $MANIFEST_PREFIX
-ec2-download-bundle -b $MANIFEST_PATH -a $ACCESS_ID -s $SECRET_KEY -k $PRIVATE_KEY -p $MANIFEST_PREFIX -d /mnt
+    if arch | grep -q '^i.*86$'
+    then
+	ARCH='i386'
+    else
+	ARCH='x86_64'
+    fi
 
-echo unbundling, this will take a while
-echo ec2-unbundle -k $PRIVATE_KEY -m /mnt/$MANIFEST_PREFIX.manifest.xml  -s /mnt -d /mnt
-ec2-unbundle -k $PRIVATE_KEY -m /mnt/$MANIFEST_PREFIX.manifest.xml  -s /mnt -d /mnt
+    AMI_SRC=$(df / | tail -1 | cut -f1 -d ' ')
+else
+    IFS='' AMI_DATA=$(ec2dim -v $AMI_ID)
+    ARCH=$(echo $AMI_DATA | grep 'architecture' | sed -e 's/^.*architecture>\(.*\)<.*$/\1/')
+    MANIFEST_PATH=$(echo $AMI_DATA | grep 'imageLocation' | sed -e 's/^.*imageLocation>\(.*\)\/\(.*\)<.*$/\/\1/')
+    MANIFEST_PREFIX=$echo $AMI_DATA | grep 'name' | sed -e 's/^.*name>\(.*\)<.*$/\1/')
+    
+    echo grabbing bundle $MANIFEST_PATH -- $MANIFEST_PREFIX
+    ec2-download-bundle -b $MANIFEST_PATH -a $ACCESS_ID -s $SECRET_KEY -k $PRIVATE_KEY -p $MANIFEST_PREFIX -d /mnt
+    
+    echo unbundling, this will take a while
+    echo ec2-unbundle -k $PRIVATE_KEY -m /mnt/$MANIFEST_PREFIX.manifest.xml  -s /mnt -d /mnt
+    ec2-unbundle -k $PRIVATE_KEY -m /mnt/$MANIFEST_PREFIX.manifest.xml  -s /mnt -d /mnt
+    
+    echo "Checking the size of grabbed and unbundled file: /mnt/$MANIFEST_PREFIX"
+    (( VOL_SIZE = $(du -k --apparent-size /mnt/$MANIFEST_PREFIX | cut -f1) /1024 /1024 + 2))
 
-echo "Checking the size of grabbed and unbundled file: /mnt/$MANIFEST_PREFIX"
-(( VOL_SIZE = $(du -k --apparent-size /mnt/$MANIFEST_PREFIX | cut -f1) /1024 /1024 + 2))
+    AMI_SRC=/mnt/$MANIFEST_PREFIX
+fi
+
 echo "Will create a new volume with size $VOL_SIZE"
-
-ZONE=`curl http://169.254.169.254/latest/meta-data/placement/availability-zone`
-VOL_ID=`$EC2_HOME/bin/ec2addvol -s $VOL_SIZE -z $ZONE | cut -f2`
+ZONE=$(curl http://169.254.169.254/latest/meta-data/placement/availability-zone)
+VOL_ID=$($EC2_HOME/bin/ec2addvol -s $VOL_SIZE -z $ZONE | cut -f2)
 STATUS=creating
 echo "Created volume with ID $VOL_ID with size $VOL_SIZE GB"
 while ! echo $STATUS | grep -q "available"
 do
   echo "Volume $VOL_ID status is currently '$STATUS', waiting for it to become 'available'..."
   sleep 3
-  STATUS=`$EC2_HOME/bin/ec2dvol $VOL_ID | cut -f6`
+  STATUS=$($EC2_HOME/bin/ec2dvol $VOL_ID | cut -f6)
   echo "Volume $VOL_ID status is currently '$STATUS', waiting for it to become 'available'..."
 done
 
-INST_ID=`curl http://169.254.169.254/latest/meta-data/instance-id`
+INST_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
 echo $EC2_HOME/bin/ec2attvol $VOL_ID -i $INST_ID -d $EBS_DEV
 $EC2_HOME/bin/ec2attvol $VOL_ID -i $INST_ID -d $EBS_DEV
 STATUS=creating
@@ -116,13 +126,13 @@ while ! echo $STATUS | grep -q "attached"
 do
   echo "Volume $VOL_ID status is currently '$STATUS', waiting for it to become 'attached'..."
   sleep 3
-  STATUS=`$EC2_HOME/bin/ec2dvol $VOL_ID | grep ATTACHMENT | cut -f5`
+  STATUS=$($EC2_HOME/bin/ec2dvol $VOL_ID | grep ATTACHMENT | cut -f5)
   echo "Volume $VOL_ID status is currently '$STATUS', waiting for it to become 'attached'..."
 done
 
 echo copying image to volume, this will also take a while
-echo dd if=/mnt/$MANIFEST_PREFIX of=$EBS_DEV
-time dd if=/mnt/$MANIFEST_PREFIX of=$EBS_DEV
+echo dd if=$AMI_SRC of=$EBS_DEV
+time dd if=$AMI_SRC of=$EBS_DEV
 
 if ! test -d /perm
 then
@@ -142,13 +152,13 @@ sleep 30
 
 umount /perm
 $EC2_HOME/bin/ec2detvol $VOL_ID -i $INST_ID
-SNAP_ID=`$EC2_HOME/bin/ec2addsnap $VOL_ID -d "created by George's Modified createAMI.sh" | cut -f2`
+SNAP_ID=$($EC2_HOME/bin/ec2addsnap $VOL_ID -d "created by George's Modified createAMI.sh" | cut -f2)
 STATUS=pending
 echo volume $STATUS, waiting for snap complete...
 while ! echo $STATUS | grep -q "completed"
 do
   sleep 3
-  STATUS=`$EC2_HOME/bin/ec2dsnap $SNAP_ID | cut -f4`
+  STATUS=$($EC2_HOME/bin/ec2dsnap $SNAP_ID | cut -f4)
   echo volume $STATUS, waiting for snap complete...
 done
 
